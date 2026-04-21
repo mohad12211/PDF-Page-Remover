@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, memo } from 'react';
 import { PDFDocument } from 'pdf-lib';
 import * as pdfjs from 'pdfjs-dist';
 // @ts-ignore
@@ -14,7 +14,9 @@ import {
   Loader2,
   ChevronRight,
   ChevronLeft,
-  Info
+  Info,
+  LayoutGrid,
+  Image as ImageIcon
 } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -27,75 +29,185 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-interface PagePreview {
-  index: number;
-  dataUrl: string;
-}
+const PageThumbnail = memo(({ 
+  index, 
+  pdfProxy, 
+  isSelected, 
+  actionMode, 
+  quality,
+  onToggle,
+  onSelectOnly
+}: { 
+  index: number; 
+  pdfProxy: pdfjs.PDFDocumentProxy; 
+  isSelected: boolean; 
+  actionMode: 'remove' | 'keep'; 
+  quality: number;
+  onToggle: (index: number, isShiftKey: boolean) => void;
+  onSelectOnly: (index: number) => void;
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [rendered, setRendered] = useState(false);
+  const [isVisible, setIsVisible] = useState(false);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        setIsVisible(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: '600px', threshold: 0.01 }); // render even slightly earlier
+    
+    if (containerRef.current) {
+      observer.observe(containerRef.current);
+    }
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    // Re-render if pdfProxy changes (e.g. after removing pages)
+    setRendered(false);
+  }, [pdfProxy, quality]);
+
+  useEffect(() => {
+    let renderTask: any = null;
+    let isCancelled = false;
+    let page: any = null;
+
+    if (isVisible && !rendered && pdfProxy && canvasRef.current) {
+      const renderPage = async () => {
+        try {
+          page = await pdfProxy.getPage(index + 1);
+          if (isCancelled) return;
+          
+          const viewport = page.getViewport({ scale: quality });
+          const canvas = canvasRef.current;
+          if (!canvas) return;
+          
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const context = canvas.getContext('2d');
+          
+          if (context) {
+            renderTask = page.render({ canvasContext: context, viewport, canvas });
+            await renderTask.promise;
+            if (!isCancelled) {
+              setRendered(true);
+            }
+          }
+        } catch (err: any) {
+          // Ignore cancellation errors
+          if (err?.name === 'RenderingCancelledException') return;
+          console.error(`Error rendering page ${index + 1}:`, err?.message || err);
+        } finally {
+          if (page) {
+            page.cleanup();
+          }
+        }
+      };
+      renderPage();
+    }
+    
+    return () => { 
+      isCancelled = true; 
+      if (renderTask) {
+        renderTask.cancel();
+      }
+    };
+  }, [isVisible, rendered, index, pdfProxy, quality]);
+
+  return (
+    <motion.div
+      ref={containerRef}
+      layout
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      whileHover={{ y: -4 }}
+      onClick={(e) => onToggle(index, e.shiftKey)}
+      className={cn(
+        "group relative cursor-pointer overflow-hidden rounded-xl border-2 bg-white transition-all select-none",
+        isSelected 
+          ? (actionMode === 'remove' ? "border-red-500 ring-4 ring-red-50" : "border-blue-500 ring-4 ring-blue-50")
+          : "border-neutral-200 hover:border-neutral-300"
+      )}
+    >
+      <div className="aspect-[3/4] overflow-hidden bg-neutral-100 flex items-center justify-center">
+        {!rendered && <Loader2 className="animate-spin text-neutral-400" size={24} />}
+        <canvas 
+          ref={canvasRef} 
+          className={cn("w-full h-full object-contain bg-white", !rendered && "hidden")} 
+        />
+      </div>
+      
+      <div className={cn(
+        "flex items-center justify-between border-t p-2 transition-colors",
+        isSelected 
+          ? (actionMode === 'remove' ? "bg-red-50 border-red-100" : "bg-blue-50 border-blue-100")
+          : "bg-white border-neutral-100"
+      )}>
+        <span className={cn(
+          "text-xs font-bold",
+          isSelected 
+            ? (actionMode === 'remove' ? "text-red-700" : "text-blue-700")
+            : "text-neutral-500"
+        )}>
+          Page {index + 1}
+        </span>
+        {isSelected ? (
+          <CheckSquare size={16} className={actionMode === 'remove' ? "text-red-600" : "text-blue-600"} />
+        ) : (
+          <Square size={16} className="text-neutral-300 group-hover:text-neutral-400" />
+        )}
+      </div>
+
+      {/* Hover Overlay for Single Remove/Keep Selection */}
+      <div className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all group-hover:bg-black/5 group-hover:opacity-100">
+        {!isSelected && (
+          <button 
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelectOnly(index);
+            }}
+            className={cn(
+              "rounded-full bg-white p-2 text-neutral-900 shadow-lg transition-colors",
+              actionMode === 'remove' ? "hover:bg-red-600 hover:text-white" : "hover:bg-blue-600 hover:text-white"
+            )}
+          >
+            <CheckSquare size={20} />
+          </button>
+        )}
+      </div>
+    </motion.div>
+  );
+});
 
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
-  const [previews, setPreviews] = useState<PagePreview[]>([]);
+  const [pdfProxy, setPdfProxy] = useState<pdfjs.PDFDocumentProxy | null>(null);
+  const [totalPages, setTotalPages] = useState<number>(0);
   const [selectedPages, setSelectedPages] = useState<Set<number>>(new Set());
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionMode, setActionMode] = useState<'remove' | 'keep'>('remove');
+  const [previewQuality, setPreviewQuality] = useState<number>(0.4);
+  const [previewSize, setPreviewSize] = useState<'small' | 'medium' | 'large'>('medium');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const generatePreviews = async (pdfData: Uint8Array) => {
-    let pdf: any = null;
+  const loadPdfProxy = async (pdfData: Uint8Array) => {
     try {
       const loadingTask = pdfjs.getDocument({ 
         data: pdfData,
         disableAutoFetch: true,
         disableStream: true,
       });
-      pdf = await loadingTask.promise;
-      
-      const canvas = document.createElement('canvas');
-      const context = canvas.getContext('2d');
-      if (!context) throw new Error('Could not get canvas context');
-
-      // Process in chunks to keep UI responsive and reduce memory pressure
-      const CHUNK_SIZE = 5;
-      const totalPages = pdf.numPages;
-      
-      for (let i = 1; i <= totalPages; i += CHUNK_SIZE) {
-        const chunkPreviews: PagePreview[] = [];
-        const end = Math.min(i + CHUNK_SIZE - 1, totalPages);
-        
-        for (let j = i; j <= end; j++) {
-          const page = await pdf.getPage(j);
-          // Lower scale for thumbnails to save memory and time
-          const viewport = page.getViewport({ scale: 0.4 });
-          
-          canvas.height = viewport.height;
-          canvas.width = viewport.width;
-          
-          await page.render({ 
-            canvasContext: context, 
-            viewport,
-          }).promise;
-
-          chunkPreviews.push({
-            index: j - 1,
-            dataUrl: canvas.toDataURL('image/jpeg', 0.7), // Use JPEG with compression
-          });
-          
-          page.cleanup();
-        }
-
-        setPreviews(prev => [...prev, ...chunkPreviews]);
-        // Small delay to allow UI to breathe
-        await new Promise(resolve => setTimeout(resolve, 0));
-      }
+      const pdf = await loadingTask.promise;
+      setPdfProxy(pdf);
+      setTotalPages(pdf.numPages);
     } catch (err) {
-      console.error('Error generating previews:', err);
-      setError('Failed to generate page previews.');
-    } finally {
-      if (pdf) {
-        await pdf.destroy();
-      }
+      console.error('Error parsing PDF data:', err);
+      setError('Failed to load PDF.');
     }
   };
 
@@ -109,40 +221,46 @@ export default function App() {
     setError(null);
     setIsProcessing(true);
     setFile(uploadedFile);
-    setPreviews([]); // Clear old previews
+    setPdfProxy(null);
+    setTotalPages(0);
     setSelectedPages(new Set());
     setLastSelectedIndex(null);
 
     const reader = new FileReader();
     reader.onload = async (event) => {
       if (event.target?.result instanceof ArrayBuffer) {
-        await generatePreviews(new Uint8Array(event.target.result));
+        await loadPdfProxy(new Uint8Array(event.target.result));
         setIsProcessing(false);
       }
     };
     reader.readAsArrayBuffer(uploadedFile);
   };
 
-  const togglePageSelection = (index: number, isShiftKey: boolean) => {
-    const newSelected = new Set(selectedPages);
-    
-    if (isShiftKey && lastSelectedIndex !== null) {
-      const start = Math.min(lastSelectedIndex, index);
-      const end = Math.max(lastSelectedIndex, index);
-      for (let i = start; i <= end; i++) {
-        newSelected.add(i);
-      }
-    } else {
-      if (newSelected.has(index)) {
-        newSelected.delete(index);
+  const togglePageSelection = useCallback((index: number, isShiftKey: boolean) => {
+    setSelectedPages(prev => {
+      const newSelected = new Set(prev);
+      if (isShiftKey && lastSelectedIndex !== null) {
+        const start = Math.min(lastSelectedIndex, index);
+        const end = Math.max(lastSelectedIndex, index);
+        for (let i = start; i <= end; i++) {
+          newSelected.add(i);
+        }
       } else {
-        newSelected.add(index);
+        if (newSelected.has(index)) {
+          newSelected.delete(index);
+        } else {
+          newSelected.add(index);
+        }
       }
-      setLastSelectedIndex(index);
-    }
-    
-    setSelectedPages(newSelected);
-  };
+      return newSelected;
+    });
+    setLastSelectedIndex(index);
+  }, [lastSelectedIndex]);
+
+  const selectOnlyPage = useCallback((index: number) => {
+    setSelectedPages(new Set([index]));
+    setLastSelectedIndex(index);
+  }, []);
 
   const processPdf = async () => {
     if (!file || selectedPages.size === 0) return;
@@ -174,10 +292,9 @@ export default function App() {
       const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
       
       setFile(newFile);
-      setPreviews([]); // Clear old previews
       setSelectedPages(new Set());
       setLastSelectedIndex(null);
-      await generatePreviews(pdfBytes);
+      await loadPdfProxy(pdfBytes);
     } catch (err) {
       console.error('Error processing PDF:', err);
       setError('Failed to process PDF.');
@@ -200,7 +317,8 @@ export default function App() {
 
   const reset = () => {
     setFile(null);
-    setPreviews([]);
+    setPdfProxy(null);
+    setTotalPages(0);
     setSelectedPages(new Set());
     setLastSelectedIndex(null);
     setError(null);
@@ -278,68 +396,107 @@ export default function App() {
               className="space-y-8"
             >
               {/* Toolbar */}
-              <div className="flex flex-col gap-4 rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="flex flex-col">
-                    <span className="text-sm font-semibold text-neutral-900">{file.name}</span>
-                    <span className="text-xs text-neutral-500">{previews.length} pages total</span>
+              <div className="flex flex-col gap-4 rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className="flex flex-col">
+                      <span className="text-sm font-semibold text-neutral-900">{file.name}</span>
+                      <span className="text-xs text-neutral-500">{totalPages} pages total</span>
+                    </div>
+                    <div className="h-8 w-px bg-neutral-200" />
+                    <div className="flex items-center gap-2 text-sm font-medium text-neutral-600">
+                      <span className={cn(
+                        "flex h-6 min-w-[1.5rem] items-center justify-center rounded-full bg-neutral-100 px-1.5 text-xs",
+                        selectedPages.size > 0 && (actionMode === 'remove' ? "bg-red-100 text-red-700" : "bg-blue-100 text-blue-700")
+                      )}>
+                        {selectedPages.size}
+                      </span>
+                      selected
+                    </div>
                   </div>
-                  <div className="h-8 w-px bg-neutral-200" />
-                  <div className="flex items-center gap-2 text-sm font-medium text-neutral-600">
-                    <span className={cn(
-                      "flex h-6 min-w-[1.5rem] items-center justify-center rounded-full bg-neutral-100 px-1.5 text-xs",
-                      selectedPages.size > 0 && (actionMode === 'remove' ? "bg-red-100 text-red-700" : "bg-blue-100 text-blue-700")
-                    )}>
-                      {selectedPages.size}
-                    </span>
-                    selected
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="mr-2 flex items-center rounded-lg bg-neutral-100 p-1">
+                      <button
+                        onClick={() => setActionMode('remove')}
+                        className={cn(
+                          "rounded-md px-3 py-1.5 text-sm font-medium transition-all",
+                          actionMode === 'remove' ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500 hover:text-neutral-700"
+                        )}
+                      >
+                        Remove Mode
+                      </button>
+                      <button
+                        onClick={() => setActionMode('keep')}
+                        className={cn(
+                          "rounded-md px-3 py-1.5 text-sm font-medium transition-all",
+                          actionMode === 'keep' ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500 hover:text-neutral-700"
+                        )}
+                      >
+                        Keep Mode
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => setSelectedPages(new Set(Array.from({ length: totalPages }, (_, i) => i)))}
+                      className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      onClick={() => setSelectedPages(new Set())}
+                      className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={processPdf}
+                      disabled={selectedPages.size === 0 || isProcessing}
+                      className={cn(
+                        "flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium text-white shadow-sm transition-all disabled:opacity-50",
+                        actionMode === 'remove' ? "bg-red-600 hover:bg-red-700" : "bg-blue-600 hover:bg-blue-700"
+                      )}
+                    >
+                      {isProcessing ? <Loader2 className="animate-spin" size={18} /> : (actionMode === 'remove' ? <Trash2 size={18} /> : <Download size={18} />)}
+                      {actionMode === 'remove' ? 'Remove Selected' : 'Keep Selected'}
+                    </button>
                   </div>
                 </div>
+              </div>
 
-                <div className="flex items-center gap-2">
-                  <div className="mr-2 flex items-center rounded-lg bg-neutral-100 p-1">
-                    <button
-                      onClick={() => setActionMode('remove')}
-                      className={cn(
-                        "rounded-md px-3 py-1.5 text-sm font-medium transition-all",
-                        actionMode === 'remove' ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500 hover:text-neutral-700"
-                      )}
+              {/* View Settings */}
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between rounded-xl bg-white p-3 border border-neutral-100 shadow-sm">
+                <div className="flex items-center gap-2 text-sm text-neutral-500 font-medium px-1">
+                  View Settings
+                </div>
+                <div className="flex flex-wrap items-center gap-4">
+                  <div className="flex items-center gap-2">
+                    <LayoutGrid className="text-neutral-400" size={16} />
+                    <label className="text-sm font-medium text-neutral-600">Size</label>
+                    <select
+                      value={previewSize}
+                      onChange={(e) => setPreviewSize(e.target.value as any)}
+                      className="rounded-md border border-neutral-200 bg-neutral-50 px-2 py-1 text-sm text-neutral-700 outline-none focus:border-neutral-400 focus:ring-1 focus:ring-neutral-400"
                     >
-                      Remove Mode
-                    </button>
-                    <button
-                      onClick={() => setActionMode('keep')}
-                      className={cn(
-                        "rounded-md px-3 py-1.5 text-sm font-medium transition-all",
-                        actionMode === 'keep' ? "bg-white text-neutral-900 shadow-sm" : "text-neutral-500 hover:text-neutral-700"
-                      )}
-                    >
-                      Keep Mode
-                    </button>
+                      <option value="small">Small</option>
+                      <option value="medium">Medium</option>
+                      <option value="large">Large</option>
+                    </select>
                   </div>
-                  <button
-                    onClick={() => setSelectedPages(new Set(previews.map(p => p.index)))}
-                    className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100"
-                  >
-                    Select All
-                  </button>
-                  <button
-                    onClick={() => setSelectedPages(new Set())}
-                    className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-100"
-                  >
-                    Clear
-                  </button>
-                  <button
-                    onClick={processPdf}
-                    disabled={selectedPages.size === 0 || isProcessing}
-                    className={cn(
-                      "flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium text-white shadow-sm transition-all disabled:opacity-50",
-                      actionMode === 'remove' ? "bg-red-600 hover:bg-red-700" : "bg-blue-600 hover:bg-blue-700"
-                    )}
-                  >
-                    {isProcessing ? <Loader2 className="animate-spin" size={18} /> : (actionMode === 'remove' ? <Trash2 size={18} /> : <Download size={18} />)}
-                    {actionMode === 'remove' ? 'Remove Selected' : 'Keep Selected'}
-                  </button>
+                  <div className="w-px h-6 bg-neutral-200 hidden sm:block" />
+                  <div className="flex items-center gap-2">
+                    <ImageIcon className="text-neutral-400" size={16} />
+                    <label className="text-sm font-medium text-neutral-600">Quality</label>
+                    <select
+                      value={previewQuality}
+                      onChange={(e) => setPreviewQuality(Number(e.target.value))}
+                      className="rounded-md border border-neutral-200 bg-neutral-50 px-2 py-1 text-sm text-neutral-700 outline-none focus:border-neutral-400 focus:ring-1 focus:ring-neutral-400"
+                    >
+                      <option value={0.2}>Low</option>
+                      <option value={0.4}>Medium</option>
+                      <option value={0.8}>High</option>
+                      <option value={1.5}>Ultra</option>
+                    </select>
+                  </div>
                 </div>
               </div>
 
@@ -353,79 +510,30 @@ export default function App() {
               </div>
 
               {/* Grid */}
-              {isProcessing && previews.length === 0 ? (
+              {isProcessing && !pdfProxy ? (
                 <div className="flex h-64 flex-col items-center justify-center gap-4">
                   <Loader2 className="animate-spin text-red-600" size={40} />
-                  <p className="text-neutral-500 animate-pulse">Processing PDF...</p>
+                  <p className="text-neutral-500 animate-pulse">Loading PDF...</p>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-6 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-                  {previews.map((preview) => {
-                    const isSelected = selectedPages.has(preview.index);
-                    return (
-                      <motion.div
-                        layout
-                        key={preview.index}
-                        initial={{ opacity: 0, scale: 0.9 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        whileHover={{ y: -4 }}
-                        onClick={(e) => togglePageSelection(preview.index, e.shiftKey)}
-                        className={cn(
-                          "group relative cursor-pointer overflow-hidden rounded-xl border-2 bg-white transition-all",
-                          isSelected 
-                            ? (actionMode === 'remove' ? "border-red-500 ring-4 ring-red-50" : "border-blue-500 ring-4 ring-blue-50")
-                            : "border-neutral-200 hover:border-neutral-300"
-                        )}
-                      >
-                        <div className="aspect-[3/4] overflow-hidden bg-neutral-100">
-                          <img 
-                            src={preview.dataUrl} 
-                            alt={`Page ${preview.index + 1}`}
-                            className="h-full w-full object-contain"
-                          />
-                        </div>
-                        
-                        <div className={cn(
-                          "flex items-center justify-between border-t p-2 transition-colors",
-                          isSelected 
-                            ? (actionMode === 'remove' ? "bg-red-50 border-red-100" : "bg-blue-50 border-blue-100")
-                            : "bg-white border-neutral-100"
-                        )}>
-                          <span className={cn(
-                            "text-xs font-bold",
-                            isSelected 
-                              ? (actionMode === 'remove' ? "text-red-700" : "text-blue-700")
-                              : "text-neutral-500"
-                          )}>
-                            Page {preview.index + 1}
-                          </span>
-                          {isSelected ? (
-                            <CheckSquare size={16} className={actionMode === 'remove' ? "text-red-600" : "text-blue-600"} />
-                          ) : (
-                            <Square size={16} className="text-neutral-300 group-hover:text-neutral-400" />
-                          )}
-                        </div>
-
-                        {/* Hover Overlay for Single Remove */}
-                        <div className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all group-hover:bg-black/5 group-hover:opacity-100">
-                          {!isSelected && (
-                            <button 
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedPages(new Set([preview.index]));
-                              }}
-                              className={cn(
-                                "rounded-full bg-white p-2 text-neutral-900 shadow-lg transition-colors",
-                                actionMode === 'remove' ? "hover:bg-red-600 hover:text-white" : "hover:bg-blue-600 hover:text-white"
-                              )}
-                            >
-                              <CheckSquare size={20} />
-                            </button>
-                          )}
-                        </div>
-                      </motion.div>
-                    );
-                  })}
+                <div className={cn(
+                  "grid gap-4 sm:gap-6 select-none",
+                  previewSize === 'small' && "grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10",
+                  previewSize === 'medium' && "grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6",
+                  previewSize === 'large' && "grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-4"
+                )}>
+                  {pdfProxy && Array.from({ length: totalPages }).map((_, index) => (
+                    <PageThumbnail
+                      key={index} // Resetting key triggers unmount but we want stable states if possible
+                      index={index}
+                      pdfProxy={pdfProxy}
+                      actionMode={actionMode}
+                      quality={previewQuality}
+                      isSelected={selectedPages.has(index)}
+                      onToggle={togglePageSelection}
+                      onSelectOnly={selectOnlyPage}
+                    />
+                  ))}
                 </div>
               )}
             </motion.div>
@@ -433,7 +541,7 @@ export default function App() {
         </AnimatePresence>
 
         {error && (
-          <div className="fixed bottom-8 left-1/2 -translate-x-1/2 rounded-full bg-red-600 px-6 py-3 text-sm font-medium text-white shadow-xl">
+          <div className="fixed bottom-8 left-1/2 -translate-x-1/2 rounded-full bg-red-600 px-6 py-3 text-sm font-medium text-white shadow-xl z-50">
             {error}
           </div>
         )}
