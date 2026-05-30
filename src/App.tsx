@@ -3,13 +3,13 @@ import { PDFDocument } from 'pdf-lib';
 import * as pdfjs from 'pdfjs-dist';
 // @ts-ignore
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import { 
-  Upload, 
-  Trash2, 
-  Download, 
-  FileText, 
-  X, 
-  CheckSquare, 
+import {
+  Upload,
+  Trash2,
+  Download,
+  FileText,
+  X,
+  CheckSquare,
   Square,
   Loader2,
   ChevronRight,
@@ -29,19 +29,19 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-const PageThumbnail = memo(({ 
-  index, 
-  pdfProxy, 
-  isSelected, 
-  actionMode, 
+const PageThumbnail = memo(({
+  index,
+  pdfProxy,
+  isSelected,
+  actionMode,
   quality,
   onToggle,
   onSelectOnly
-}: { 
-  index: number; 
-  pdfProxy: pdfjs.PDFDocumentProxy; 
-  isSelected: boolean; 
-  actionMode: 'remove' | 'keep'; 
+}: {
+  index: number;
+  pdfProxy: pdfjs.PDFDocumentProxy;
+  isSelected: boolean;
+  actionMode: 'remove' | 'keep';
   quality: number;
   onToggle: (index: number, isShiftKey: boolean) => void;
   onSelectOnly: (index: number) => void;
@@ -58,7 +58,7 @@ const PageThumbnail = memo(({
         observer.disconnect();
       }
     }, { rootMargin: '600px', threshold: 0.01 }); // render even slightly earlier
-    
+
     if (containerRef.current) {
       observer.observe(containerRef.current);
     }
@@ -80,15 +80,15 @@ const PageThumbnail = memo(({
         try {
           page = await pdfProxy.getPage(index + 1);
           if (isCancelled) return;
-          
+
           const viewport = page.getViewport({ scale: quality });
           const canvas = canvasRef.current;
           if (!canvas) return;
-          
+
           canvas.width = viewport.width;
           canvas.height = viewport.height;
           const context = canvas.getContext('2d');
-          
+
           if (context) {
             renderTask = page.render({ canvasContext: context, viewport, canvas });
             await renderTask.promise;
@@ -108,9 +108,9 @@ const PageThumbnail = memo(({
       };
       renderPage();
     }
-    
-    return () => { 
-      isCancelled = true; 
+
+    return () => {
+      isCancelled = true;
       if (renderTask) {
         renderTask.cancel();
       }
@@ -127,28 +127,28 @@ const PageThumbnail = memo(({
       onClick={(e) => onToggle(index, e.shiftKey)}
       className={cn(
         "group relative cursor-pointer overflow-hidden rounded-xl border-2 bg-white transition-all select-none",
-        isSelected 
+        isSelected
           ? (actionMode === 'remove' ? "border-red-500 ring-4 ring-red-50" : "border-blue-500 ring-4 ring-blue-50")
           : "border-neutral-200 hover:border-neutral-300"
       )}
     >
       <div className="aspect-[3/4] overflow-hidden bg-neutral-100 flex items-center justify-center">
         {!rendered && <Loader2 className="animate-spin text-neutral-400" size={24} />}
-        <canvas 
-          ref={canvasRef} 
-          className={cn("w-full h-full object-contain bg-white", !rendered && "hidden")} 
+        <canvas
+          ref={canvasRef}
+          className={cn("w-full h-full object-contain bg-white", !rendered && "hidden")}
         />
       </div>
-      
+
       <div className={cn(
         "flex items-center justify-between border-t p-2 transition-colors",
-        isSelected 
+        isSelected
           ? (actionMode === 'remove' ? "bg-red-50 border-red-100" : "bg-blue-50 border-blue-100")
           : "bg-white border-neutral-100"
       )}>
         <span className={cn(
           "text-xs font-bold",
-          isSelected 
+          isSelected
             ? (actionMode === 'remove' ? "text-red-700" : "text-blue-700")
             : "text-neutral-500"
         )}>
@@ -164,7 +164,7 @@ const PageThumbnail = memo(({
       {/* Hover Overlay for Single Remove/Keep Selection */}
       <div className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all group-hover:bg-black/5 group-hover:opacity-100">
         {!isSelected && (
-          <button 
+          <button
             onClick={(e) => {
               e.stopPropagation();
               onSelectOnly(index);
@@ -197,7 +197,7 @@ export default function App() {
 
   const loadPdfProxy = async (pdfData: Uint8Array) => {
     try {
-      const loadingTask = pdfjs.getDocument({ 
+      const loadingTask = pdfjs.getDocument({
         data: pdfData,
         disableAutoFetch: true,
         disableStream: true,
@@ -269,9 +269,9 @@ export default function App() {
     try {
       const arrayBuffer = await file.arrayBuffer();
       const pdfDoc = await PDFDocument.load(arrayBuffer);
-      
+
       let indicesToRemove: number[] = [];
-      
+
       if (actionMode === 'remove') {
         indicesToRemove = Array.from(selectedPages);
       } else {
@@ -282,7 +282,7 @@ export default function App() {
 
       // Sort indices in descending order to avoid index shifting issues
       indicesToRemove.sort((a: number, b: number) => b - a);
-      
+
       indicesToRemove.forEach((index: number) => {
         pdfDoc.removePage(index);
       });
@@ -290,7 +290,7 @@ export default function App() {
       const pdfBytes = await pdfDoc.save();
       const newBlob = new Blob([pdfBytes], { type: 'application/pdf' });
       const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
-      
+
       setFile(newFile);
       setSelectedPages(new Set());
       setLastSelectedIndex(null);
@@ -298,6 +298,44 @@ export default function App() {
     } catch (err) {
       console.error('Error processing PDF:', err);
       setError('Failed to process PDF.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const insertEmptyPage = async (position: 'start' | 'end') => {
+    if (!file) return;
+
+    setIsProcessing(true);
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const pdfDoc = await PDFDocument.load(arrayBuffer);
+      const pageCount = pdfDoc.getPageCount();
+      if (pageCount === 0) {
+        throw new Error('PDF has no pages.');
+      }
+
+      const referencePage = position === 'start'
+        ? pdfDoc.getPage(0)
+        : pdfDoc.getPage(pageCount - 1);
+      const { width, height } = referencePage.getSize();
+
+      if (position === 'start') {
+        pdfDoc.insertPage(0, [width, height]);
+      } else {
+        pdfDoc.addPage([width, height]);
+      }
+
+      const pdfBytes = await pdfDoc.save();
+      const newBlob = new Blob([pdfBytes], { type: 'application/pdf' });
+      const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
+      setFile(newFile);
+      setSelectedPages(new Set());
+      setLastSelectedIndex(null);
+      await loadPdfProxy(pdfBytes);
+    } catch (err) {
+      console.error('Error adding blank page:', err);
+      setError('Failed to add blank page.');
     } finally {
       setIsProcessing(false);
     }
@@ -336,7 +374,7 @@ export default function App() {
             </div>
             <h1 className="text-xl font-bold tracking-tight text-neutral-900">PDF Editor</h1>
           </div>
-          
+
           {file && (
             <div className="flex items-center gap-3">
               <button
@@ -369,7 +407,7 @@ export default function App() {
               exit={{ opacity: 0, scale: 0.95 }}
               className="flex flex-col items-center justify-center py-20"
             >
-              <div 
+              <div
                 onClick={() => fileInputRef.current?.click()}
                 className="group relative flex h-80 w-full max-w-2xl cursor-pointer flex-col items-center justify-center rounded-3xl border-2 border-dashed border-neutral-300 bg-white transition-all hover:border-red-500 hover:bg-red-50/30"
               >
@@ -458,6 +496,20 @@ export default function App() {
                     >
                       {isProcessing ? <Loader2 className="animate-spin" size={18} /> : (actionMode === 'remove' ? <Trash2 size={18} /> : <Download size={18} />)}
                       {actionMode === 'remove' ? 'Remove Selected' : 'Keep Selected'}
+                    </button>
+                    <button
+                      onClick={() => insertEmptyPage('start')}
+                      disabled={isProcessing}
+                      className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-50"
+                    >
+                      Add Blank Page Start
+                    </button>
+                    <button
+                      onClick={() => insertEmptyPage('end')}
+                      disabled={isProcessing}
+                      className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-sm font-medium text-neutral-700 hover:bg-neutral-50 disabled:opacity-50"
+                    >
+                      Add Blank Page End
                     </button>
                   </div>
                 </div>
