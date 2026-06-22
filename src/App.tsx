@@ -66,8 +66,16 @@ const PageThumbnail = memo(({
   }, []);
 
   useEffect(() => {
-    // Re-render if pdfProxy changes (e.g. after removing pages)
+    // Re-render if pdfProxy changes (e.g. after removing pages) or quality changes
     setRendered(false);
+    // Clear the canvas to free bitmap memory immediately
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   }, [pdfProxy, quality]);
 
   useEffect(() => {
@@ -194,8 +202,10 @@ export default function App() {
   const [previewQuality, setPreviewQuality] = useState<number>(0.4);
   const [previewSize, setPreviewSize] = useState<'small' | 'medium' | 'large'>('medium');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Keep a ref to the current proxy so we can destroy it before replacing
+  const pdfProxyRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
 
-  const loadPdfProxy = async (pdfData: Uint8Array) => {
+  const loadPdfProxy = useCallback(async (pdfData: Uint8Array) => {
     try {
       const loadingTask = pdfjs.getDocument({
         data: pdfData,
@@ -203,13 +213,18 @@ export default function App() {
         disableStream: true,
       });
       const pdf = await loadingTask.promise;
+      // Destroy the previous document to free worker memory
+      if (pdfProxyRef.current) {
+        pdfProxyRef.current.destroy().catch(() => {});
+      }
+      pdfProxyRef.current = pdf;
       setPdfProxy(pdf);
       setTotalPages(pdf.numPages);
     } catch (err) {
       console.error('Error parsing PDF data:', err);
       setError('Failed to load PDF.');
     }
-  };
+  }, []);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const uploadedFile = e.target.files?.[0];
@@ -354,6 +369,11 @@ export default function App() {
   };
 
   const reset = () => {
+    // Destroy the document proxy to free worker memory
+    if (pdfProxyRef.current) {
+      pdfProxyRef.current.destroy().catch(() => {});
+      pdfProxyRef.current = null;
+    }
     setFile(null);
     setPdfProxy(null);
     setTotalPages(0);
@@ -576,7 +596,9 @@ export default function App() {
                 )}>
                   {pdfProxy && Array.from({ length: totalPages }).map((_, index) => (
                     <PageThumbnail
-                      key={index} // Resetting key triggers unmount but we want stable states if possible
+                      // Include fingerprint so the component remounts when a new document loads,
+                      // preventing stale canvas state and cleared-up old pdfProxy references.
+                      key={`${pdfProxy.fingerprints[0]}-${index}`}
                       index={index}
                       pdfProxy={pdfProxy}
                       actionMode={actionMode}
