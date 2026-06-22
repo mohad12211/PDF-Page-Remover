@@ -76,6 +76,16 @@ const PageThumbnail = memo(({
       canvas.width = 0;
       canvas.height = 0;
     }
+    // Also clear on unmount — this cleanup runs both when deps change AND when
+    // the component is removed from the tree, ensuring GPU/bitmap memory is
+    // released immediately rather than waiting for JS GC.
+    return () => {
+      const canvas = canvasRef.current;
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    };
   }, [pdfProxy, quality]);
 
   useEffect(() => {
@@ -205,24 +215,43 @@ export default function App() {
   // Keep a ref to the current proxy so we can destroy it before replacing
   const pdfProxyRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
 
-  const loadPdfProxy = useCallback(async (pdfData: Uint8Array) => {
+  // Accepts a Blob (or File) and loads it into PDF.js via a blob URL.
+  // This avoids creating an extra copy of the bytes in the main thread —
+  // the worker streams directly from the existing blob.
+  const loadPdfProxy = useCallback(async (pdfBlob: Blob) => {
+    // Destroy the OLD document BEFORE loading the new one.
+    // This serves two purposes:
+    //   1. The worker never holds two documents simultaneously.
+    //   2. setPdfProxy(null) causes React to unmount all old PageThumbnail
+    //      components. Their canvas cleanup effects fire during the `await`
+    //      below, freeing GPU/bitmap memory BEFORE new canvases are created.
+    if (pdfProxyRef.current) {
+      pdfProxyRef.current.destroy().catch(() => {});
+      pdfProxyRef.current = null;
+    }
+    setPdfProxy(null);
+    setTotalPages(0);
+
+    let url: string | null = null;
     try {
+      url = URL.createObjectURL(pdfBlob);
       const loadingTask = pdfjs.getDocument({
-        data: pdfData,
+        url,
         disableAutoFetch: true,
         disableStream: true,
       });
+      // React processes the setPdfProxy(null) re-render during this await,
+      // unmounting old thumbnails and releasing their canvas memory.
       const pdf = await loadingTask.promise;
-      // Destroy the previous document to free worker memory
-      if (pdfProxyRef.current) {
-        pdfProxyRef.current.destroy().catch(() => {});
-      }
       pdfProxyRef.current = pdf;
       setPdfProxy(pdf);
       setTotalPages(pdf.numPages);
     } catch (err) {
       console.error('Error parsing PDF data:', err);
       setError('Failed to load PDF.');
+    } finally {
+      // Revoke immediately — PDF.js has already read the data into the worker
+      if (url) URL.revokeObjectURL(url);
     }
   }, []);
 
@@ -241,14 +270,9 @@ export default function App() {
     setSelectedPages(new Set());
     setLastSelectedIndex(null);
 
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      if (event.target?.result instanceof ArrayBuffer) {
-        await loadPdfProxy(new Uint8Array(event.target.result));
-        setIsProcessing(false);
-      }
-    };
-    reader.readAsArrayBuffer(uploadedFile);
+    // File extends Blob — pass it directly, no FileReader copy needed
+    await loadPdfProxy(uploadedFile);
+    setIsProcessing(false);
   };
 
   const togglePageSelection = useCallback((index: number, isShiftKey: boolean) => {
@@ -282,8 +306,10 @@ export default function App() {
 
     setIsProcessing(true);
     try {
-      const arrayBuffer = await file.arrayBuffer();
+      // Use `let` so we can null references early and hint the GC
+      let arrayBuffer: ArrayBuffer | null = await file.arrayBuffer();
       const pdfDoc = await PDFDocument.load(arrayBuffer);
+      arrayBuffer = null; // release — pdf-lib has parsed it, we no longer need it
 
       let indicesToRemove: number[] = [];
 
@@ -297,19 +323,19 @@ export default function App() {
 
       // Sort indices in descending order to avoid index shifting issues
       indicesToRemove.sort((a: number, b: number) => b - a);
+      indicesToRemove.forEach((index: number) => pdfDoc.removePage(index));
 
-      indicesToRemove.forEach((index: number) => {
-        pdfDoc.removePage(index);
-      });
-
-      const pdfBytes = await pdfDoc.save();
+      let pdfBytes: Uint8Array | null = await pdfDoc.save();
+      // Create the blob once — reused for both file state AND PDF.js loading
       const newBlob = new Blob([pdfBytes], { type: 'application/pdf' });
-      const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
+      pdfBytes = null; // blob has its own copy, release the Uint8Array
 
+      const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
       setFile(newFile);
       setSelectedPages(new Set());
       setLastSelectedIndex(null);
-      await loadPdfProxy(pdfBytes);
+      // Pass the same blob — loadPdfProxy uses a blob URL so no extra copy is made
+      await loadPdfProxy(newBlob);
     } catch (err) {
       console.error('Error processing PDF:', err);
       setError('Failed to process PDF.');
@@ -323,8 +349,10 @@ export default function App() {
 
     setIsProcessing(true);
     try {
-      const arrayBuffer = await file.arrayBuffer();
+      let arrayBuffer: ArrayBuffer | null = await file.arrayBuffer();
       const pdfDoc = await PDFDocument.load(arrayBuffer);
+      arrayBuffer = null; // release early
+
       const pageCount = pdfDoc.getPageCount();
       if (pageCount === 0) {
         throw new Error('PDF has no pages.');
@@ -341,13 +369,15 @@ export default function App() {
         pdfDoc.addPage([width, height]);
       }
 
-      const pdfBytes = await pdfDoc.save();
+      let pdfBytes: Uint8Array | null = await pdfDoc.save();
       const newBlob = new Blob([pdfBytes], { type: 'application/pdf' });
+      pdfBytes = null; // blob has its own copy, release the Uint8Array
+
       const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
       setFile(newFile);
       setSelectedPages(new Set());
       setLastSelectedIndex(null);
-      await loadPdfProxy(pdfBytes);
+      await loadPdfProxy(newBlob);
     } catch (err) {
       console.error('Error adding blank page:', err);
       setError('Failed to add blank page.');
