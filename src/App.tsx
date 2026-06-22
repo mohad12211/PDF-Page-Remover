@@ -56,11 +56,16 @@ function releaseRenderSlot(): void {
   renderWaiters.shift()?.();
 }
 
+// Monotonically increasing page ID generator.
+// Each page gets a stable ID used as the React key. When pages are removed or
+// reordered, React moves the existing DOM node (preserving the canvas bitmap)
+// instead of unmounting+remounting, so unchanged pages are never re-rendered.
+let nextPageId = 0;
+function genPageId() { return `pg-${nextPageId++}`; }
 
 const PageThumbnail = memo(({
   index,
   pdfProxy,
-  firstDirtyIndex,
   isSelected,
   actionMode,
   quality,
@@ -69,7 +74,6 @@ const PageThumbnail = memo(({
 }: {
   index: number;
   pdfProxy: pdfjs.PDFDocumentProxy;
-  firstDirtyIndex: number;
   isSelected: boolean;
   actionMode: 'remove' | 'keep';
   quality: number;
@@ -80,8 +84,6 @@ const PageThumbnail = memo(({
   const containerRef = useRef<HTMLDivElement>(null);
   const [rendered, setRendered] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
-  // Track last rendered quality to distinguish quality-change from proxy-change
-  const prevQualityRef = useRef<number>(quality);
 
   useEffect(() => {
     const observer = new IntersectionObserver(([entry]) => {
@@ -97,41 +99,21 @@ const PageThumbnail = memo(({
     return () => observer.disconnect();
   }, []);
 
+  // Quality change requires a full canvas re-draw at a different resolution.
+  // Proxy changes (add/remove pages) do NOT clear the canvas: stable page IDs
+  // mean React moves existing components to new positions rather than recreating
+  // them, so their canvas bitmaps are still correct for the new document.
   useEffect(() => {
-    const qualityChanged = quality !== prevQualityRef.current;
-    prevQualityRef.current = quality;
+    setRendered(false);
+    const canvas = canvasRef.current;
+    if (canvas) { canvas.width = 0; canvas.height = 0; }
+  }, [quality]);
 
-    // Re-render this page only if:
-    //   a) the quality setting changed (always affects every page), OR
-    //   b) this page's content may have changed in the new document
-    //      (i.e. its index is at or after the first page that was modified)
-    //
-    // Pages BEFORE firstDirtyIndex are guaranteed to have identical content
-    // in the new document (e.g. pages before the removed/added page), so we
-    // skip clearing their canvas — they stay rendered with the correct image.
-    if (qualityChanged || index >= firstDirtyIndex) {
-      setRendered(false);
-      const canvas = canvasRef.current;
-      if (canvas) {
-        canvas.width = 0;
-        canvas.height = 0;
-      }
-    }
-    // NOTE: No cleanup return here. Returning a cleanup would clear the canvas
-    // on every dep change, wiping unchanged pages. Instead, unmount-only
-    // cleanup is handled by the dedicated effect below.
-  }, [pdfProxy, quality, index, firstDirtyIndex]);
-
-  // Free GPU/bitmap memory immediately when this component is removed from the
-  // tree (e.g. after removing the last page). This is intentionally separate
-  // from the effect above so it only runs on unmount, not on every dep change.
+  // Release GPU/bitmap memory when the component unmounts (page was removed).
   useEffect(() => {
     return () => {
       const canvas = canvasRef.current;
-      if (canvas) {
-        canvas.width = 0;
-        canvas.height = 0;
-      }
+      if (canvas) { canvas.width = 0; canvas.height = 0; }
     };
   }, []);
 
@@ -268,16 +250,15 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Keep a ref to the current proxy so we can destroy it before replacing
   const pdfProxyRef = useRef<pdfjs.PDFDocumentProxy | null>(null);
-  // firstDirtyIndex: the lowest page index whose content changed in the latest
-  // document update. PageThumbnails at indices below this skip re-rendering.
-  const [firstDirtyIndex, setFirstDirtyIndex] = useState<number>(0);
+  // Stable ID per page. Used as the React key so that when pages are removed
+  // or shifted, React moves existing components (preserving canvas bitmaps)
+  const [pageIds, setPageIds] = useState<string[]>([]);
 
-  // Accepts a Blob (or File) and loads it into PDF.js via a blob URL.
-  // This avoids creating an extra copy of the bytes in the main thread —
-  // the worker streams directly from the existing blob.
-  // dirtyFrom: lowest page index whose content changed. Thumbnails below this
-  // index skip re-rendering since their content is identical in the new doc.
-  const loadPdfProxy = useCallback(async (pdfBlob: Blob, dirtyFrom = 0) => {
+  // newPageIds: stable IDs for each page in the new document.
+  // Pass pre-computed IDs (from remove/keep/insert operations) so React can
+  // match old components to new positions by key and move them instead of
+  // recreating. Omit for initial load — fresh IDs will be generated.
+  const loadPdfProxy = useCallback(async (pdfBlob: Blob, newPageIds?: string[]) => {
     let url: string | null = null;
     try {
       url = URL.createObjectURL(pdfBlob);
@@ -291,10 +272,11 @@ export default function App() {
         pdfProxyRef.current.destroy().catch(() => {});
       }
       pdfProxyRef.current = pdf;
+      const ids = newPageIds ?? Array.from({ length: pdf.numPages }, genPageId);
       // React 18 batches all three into a single re-render
       setPdfProxy(pdf);
       setTotalPages(pdf.numPages);
-      setFirstDirtyIndex(dirtyFrom);
+      setPageIds(ids);
     } catch (err) {
       console.error('Error parsing PDF data:', err);
       setError('Failed to load PDF.');
@@ -315,6 +297,7 @@ export default function App() {
     setFile(uploadedFile);
     setPdfProxy(null);
     setTotalPages(0);
+    setPageIds([]);
     setSelectedPages(new Set());
     setLastSelectedIndex(null);
 
@@ -354,30 +337,25 @@ export default function App() {
 
     setIsProcessing(true);
     try {
-      // Use `let` so we can null references early and hint the GC
       let arrayBuffer: ArrayBuffer | null = await file.arrayBuffer();
       const pdfDoc = await PDFDocument.load(arrayBuffer);
-      arrayBuffer = null; // release — pdf-lib has parsed it, we no longer need it
+      arrayBuffer = null; 
 
-      let indicesToRemove: number[] = [];
-      let dirtyFrom: number;
+      let indicesToRemove: number[];
+      let newPageIds: string[];
 
       if (actionMode === 'remove') {
         indicesToRemove = Array.from(selectedPages);
-        // Pages before the first removed page are identical in the new doc
-        dirtyFrom = Math.min(...Array.from(selectedPages));
+        // Surviving pages keep their stable IDs. React will MOVE those
+        // components to their new DOM positions, preserving canvas bitmaps.
+        newPageIds = pageIds.filter((_, i) => !selectedPages.has(i));
       } else {
         // Keep mode: remove all pages EXCEPT selected ones
         const allIndices = Array.from({ length: pdfDoc.getPageCount() }, (_, i) => i);
         indicesToRemove = allIndices.filter(i => !selectedPages.has(i));
-        // Find first slot where the kept page's original index != slot position
-        // e.g. keeping {0,1,2}: all unchanged → dirtyFrom = 3
-        //      keeping {0,2,5}: slot 1 gets page 2, not page 1 → dirtyFrom = 1
+        // Keep IDs only for the surviving (selected) pages, in sorted order
         const sortedKept = Array.from(selectedPages).sort((a, b) => a - b);
-        dirtyFrom = sortedKept.length; // assume all kept pages map 1:1
-        for (let i = 0; i < sortedKept.length; i++) {
-          if (sortedKept[i] !== i) { dirtyFrom = i; break; }
-        }
+        newPageIds = sortedKept.map(i => pageIds[i]);
       }
 
       // Sort indices in descending order to avoid index shifting issues
@@ -392,7 +370,7 @@ export default function App() {
       setFile(newFile);
       setSelectedPages(new Set());
       setLastSelectedIndex(null);
-      await loadPdfProxy(newBlob, dirtyFrom);
+      await loadPdfProxy(newBlob, newPageIds);
     } catch (err) {
       console.error('Error processing PDF:', err);
       setError('Failed to process PDF.');
@@ -430,15 +408,17 @@ export default function App() {
       const newBlob = new Blob([pdfBytes], { type: 'application/pdf' });
       pdfBytes = null;
 
-      // Insert at end: all existing pages are unchanged → dirtyFrom = old count
-      // Insert at start: all pages shift by 1 → dirtyFrom = 0
-      const dirtyFrom = position === 'end' ? pageCount : 0;
+      // Existing pages keep their stable IDs (React moves, not remounts them).
+      // Only the new blank page gets a fresh ID.
+      const newPageIds = position === 'end'
+        ? [...pageIds, genPageId()]
+        : [genPageId(), ...pageIds];
 
       const newFile = new File([newBlob], file.name, { type: 'application/pdf' });
       setFile(newFile);
       setSelectedPages(new Set());
       setLastSelectedIndex(null);
-      await loadPdfProxy(newBlob, dirtyFrom);
+      await loadPdfProxy(newBlob, newPageIds);
     } catch (err) {
       console.error('Error adding blank page:', err);
       setError('Failed to add blank page.');
@@ -460,7 +440,6 @@ export default function App() {
   };
 
   const reset = () => {
-    // Destroy the document proxy to free worker memory
     if (pdfProxyRef.current) {
       pdfProxyRef.current.destroy().catch(() => {});
       pdfProxyRef.current = null;
@@ -468,6 +447,7 @@ export default function App() {
     setFile(null);
     setPdfProxy(null);
     setTotalPages(0);
+    setPageIds([]);
     setSelectedPages(new Set());
     setLastSelectedIndex(null);
     setError(null);
@@ -687,10 +667,9 @@ export default function App() {
                 )}>
                   {pdfProxy && Array.from({ length: totalPages }).map((_, index) => (
                     <PageThumbnail
-                      key={index}
+                      key={pageIds[index]}
                       index={index}
                       pdfProxy={pdfProxy}
-                      firstDirtyIndex={firstDirtyIndex}
                       actionMode={actionMode}
                       quality={previewQuality}
                       isSelected={selectedPages.has(index)}
